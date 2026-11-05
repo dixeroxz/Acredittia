@@ -71,9 +71,160 @@ La semilla local crea el administrador y la empresa demo, y los deja aprobados. 
 
 El navegador habla con Next.js. Esa aplicación llama a FastAPI bajo el prefijo `/api/v1`. La API lee y escribe PostgreSQL. La revisión de documentos y el recálculo de vencimientos pasan por Redis y Celery. En local los archivos quedan en disco. El diseño de nube los deja en Azure Blob Storage: el navegador sube el binario con una dirección de vigencia corta, y la API solo registra la ruta.
 
+```
+Navegador
+    │
+    ▼
+Next.js :3000  ── HTTP /api/v1 ──►  FastAPI :8000
+                                        │
+                      ┌─────────────────┼─────────────────┐
+                      ▼                 ▼                 ▼
+                PostgreSQL 16       Redis 7         Disco local
+                :5432               :6379           /data/uploads
+                                        │
+                                        ▼
+                                 Celery worker
+                                 Celery beat (America/Santiago)
+```
+
 El esquema no lo crea la API al arrancar. Lo aplica el proceso de migración, para que varias réplicas no compitan por el mismo DDL. Cada petición de negocio fija la empresa en la sesión. PostgreSQL, con Row Level Security, devuelve solo las filas de esa empresa. Hay tres roles de cuenta: administrador de la plataforma, administrador de la empresa y administrador de un contrato. El personal y los equipos son sujetos de la carpeta, no usuarios del portal.
 
-El planificador, en hora de Santiago, recalcula vencimientos, purga archivos temporales y dispara los reportes programados. La revisión de un documento queda encolada al confirmar el archivo. El motor por defecto es simulado.
+El planificador, en hora de Santiago, recalcula vencimientos a las 00:30, purga archivos temporales a las 04:00 y dispara los reportes programados cada hora, al minuto 5. La revisión de un documento queda encolada al confirmar el archivo. El motor por defecto es simulado.
+
+En local esas piezas son contenedores. Hay dos imágenes, definidas en `app/backend/Dockerfile` y `app/frontend/Dockerfile`, y un solo orquestador, `app/docker-compose.yml`. La configuración entra por variables de entorno. Compose las declara en cada servicio. Quien corre la API fuera de Compose puede usar un archivo `.env`.
+
+## Dockerfile
+
+Hay dos Dockerfiles. Compose construye ambos con `docker compose up --build`.
+
+### API, worker, beat y migración
+
+`app/backend/Dockerfile` parte de `python:3.12-slim` y produce una sola imagen para cuatro procesos. El código es el mismo. Cambia el comando.
+
+| Paso | Qué hace |
+|---|---|
+| Base | Python 3.12 en imagen slim. Instala `curl` para el chequeo de salud. |
+| Dependencias | Copia `requirements.txt` e instala con pip, sin caché. |
+| Código | Copia `app/`, `worker/`, `migrate/` y `tests/` a `/srv`. |
+| Usuario | Crea el usuario `acredittia` (uid 10001), sin privilegios, y los directorios `/data/uploads` y `/data/keys`. |
+| Salud | `GET http://localhost:8000/health` cada 30 segundos. |
+| Comando por defecto | `uvicorn app.main:app --host 0.0.0.0 --port 8000`. Expone el puerto 8000. |
+
+Compose reemplaza ese comando en tres servicios: `python -m migrate.run` en la migración, `celery -A worker.celery_app worker` en el worker y `celery -A worker.celery_app beat` en el planificador.
+
+### Interfaz web
+
+`app/frontend/Dockerfile` parte de `node:20-alpine` y usa tres etapas.
+
+| Etapa | Qué hace |
+|---|---|
+| `deps` | Copia `package.json` e instala con npm. |
+| `build` | Recibe `NEXT_PUBLIC_API_URL` (por defecto `http://localhost:8000`) y ejecuta `npm run build`. |
+| Final | Copia el resultado `standalone`, los estáticos y `public/`. Arranca con `node server.js` en el puerto 3000. |
+
+El build de Docker usa la salida `standalone` de Next.js. En Vercel esa salida se omite, porque `next.config.mjs` la desactiva cuando existe la variable `VERCEL`.
+
+## Docker Compose
+
+El archivo es `app/docker-compose.yml`. Un `docker compose up --build` dentro de `app/` levanta el circuito completo. El orden lo marcan las dependencias: PostgreSQL y Redis tienen que estar sanos, la migración aplica el SQL y termina, y solo entonces suben la API, el worker y el planificador. La web espera a la API.
+
+| Servicio | Imagen o build | Proceso | Puerto |
+|---|---|---|---|
+| `db` | `postgres:16` | Base `acredittia`. Volumen `pgdata`. | 5432 |
+| `redis` | `redis:7-alpine` | Cola, sin persistencia (`--save ""`). | 6379 |
+| `migrate` | `./backend` | `python -m migrate.run`. Monta `modelo_datos/` en `/schema` y termina. | — |
+| `api` | `./backend` | Uvicorn. Volúmenes `uploads` y `keys`. | 8000 |
+| `worker` | `./backend` | Celery, concurrencia 2. Mismos volúmenes de archivos y claves. | — |
+| `beat` | `./backend` | Celery beat. La agenda se escribe en `/tmp`. | — |
+| `web` | `./frontend` | Next.js. El build recibe `NEXT_PUBLIC_API_URL=http://localhost:8000`. | 3000 |
+
+`db` y `redis` tienen healthcheck (`pg_isready` y `redis-cli ping`). La API, dentro de la imagen, también comprueba `GET /health`.
+
+En este Compose los procesos de base usan el usuario de desarrollo `postgres`. La separación en tres roles (`acredittia_owner`, `acredittia_app`, `acredittia_worker`) está descrita para Azure y no está aplicada en el archivo local. Los valores de `JWT_SECRET`, de la base y de Redis que trae el archivo son de desarrollo.
+
+Para detener y conservar los volúmenes: `docker compose down`. Para borrar también la base, los archivos y las claves locales: `docker compose down -v`.
+
+## Variables de entorno
+
+No hay un `.env.example` versionado. `.gitignore` ignora `.env` y `.env.*`, y deja pasar solo un `.env.example` que el repositorio no incluye. Compose no lee un archivo `.env` para arrancar: escribe las variables en cada servicio. La API sí acepta un `.env` junto al proceso, porque `app/backend/app/config.py` lo carga con Pydantic Settings. Sirve para correr Uvicorn fuera de Docker, con PostgreSQL ya migrado.
+
+El bloque siguiente es el ejemplo local. Los secretos de terceros quedan vacíos. `JWT_SECRET` y la clave de PostgreSQL son los valores de desarrollo que ya declara `docker-compose.yml`. En un despliegue real se reemplazan. No se commitea este archivo.
+
+```bash
+# app/backend/.env  — ejemplo local, no versionar
+
+# Base
+DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/acredittia
+SCHEMA_DIR=/schema
+SCHEMA_VERSION_ESPERADA=6
+DB_APPLY_SCHEMA_ON_START=false
+DB_RLS_ENABLED=true
+
+# Sesión
+JWT_SECRET=dev-secret-cambiar-en-produccion
+ACCESS_TTL_MIN=30
+REFRESH_TTL_DAYS=30
+RESET_TTL_MIN=60
+CORS_ORIGINS=http://localhost:3000
+
+# Archivos: local en este corte. azure solo con cuenta y contenedor reales.
+STORAGE_BACKEND=local
+STORAGE_DIR=/data/uploads
+AZURE_STORAGE_ACCOUNT=
+AZURE_BLOB_CONN=
+AZURE_BLOB_CONTAINER=docs
+SAS_UPLOAD_TTL_MIN=15
+SAS_DOWNLOAD_TTL_MIN=15
+PUBLIC_BASE_URL=http://localhost:8000
+
+# Cola. Compose usa celery. Sin Redis, inproc agenda dentro del mismo proceso.
+QUEUE_BACKEND=celery
+REDIS_URL=redis://localhost:6379/0
+
+# Cifrado de credenciales de plataforma. keyvault es el diseño de producción.
+JWE_BACKEND=local
+AZURE_KEYVAULT_URL=
+KEYVAULT_KEY_NAME=plataforma-cred
+KEYS_DIR=/data/keys
+CREDENCIAL_TTL_MESES=12
+
+# Revisión. simulada no llama a un proveedor. claude exige la clave.
+IA_BACKEND=simulada
+ANTHROPIC_API_KEY=
+
+# Correo y mensajería. Vacío: el reset de contraseña no envía correo.
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASSWORD=
+EMAIL_FROM=no-reply@acredittia.cl
+WHATSAPP_TOKEN=
+WHATSAPP_PHONE_ID=
+WHATSAPP_VERIFY_TOKEN=
+
+# Pagos, fuera de este corte.
+PAGOS_WEBHOOK_SECRET=
+
+# Límites
+MAX_UPLOAD_MB=20
+PAGE_SIZE_DEFAULT=25
+PAGE_SIZE_MAX=100
+MATRIZ_FILAS_MAX=200
+EXPORT_FILAS_MAX=5000
+```
+
+Dos variables no entran en ese archivo y solo aplican si el proceso se separa: `MIGRATE_DATABASE_URL` la lee el job de migración y `WORKER_DATABASE_URL` la lee el worker. En Compose ambos usan `DATABASE_URL`.
+
+La web, en build, necesita:
+
+```bash
+# app/frontend  — argumento de build, no un secreto
+NEXT_PUBLIC_API_URL=http://localhost:8000
+# Distinto de 0: las pantallas de usuarios, sistemas e indicadores leen el simulador.
+NEXT_PUBLIC_OPS_MOCK=1
+```
+
+PostgreSQL del Compose, solo en el servicio `db`: `POSTGRES_DB=acredittia`, `POSTGRES_USER=postgres`, `POSTGRES_PASSWORD=postgres`.
 
 ## Mapa de carpetas
 
